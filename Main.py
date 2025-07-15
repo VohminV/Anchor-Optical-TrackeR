@@ -50,7 +50,7 @@ def save_offset(avg_x, avg_y, angle):
         logging.error(f"Error saving offsets: {e}")
 
 def init_kalman():
-    kf = cv2.KalmanFilter(3, 3)  # 3 состояния: dx, dy, angle
+    kf = cv2.KalmanFilter(3, 3)  # состояния: dx, dy, angle
     kf.transitionMatrix = np.eye(3, dtype=np.float32)
     kf.measurementMatrix = np.eye(3, dtype=np.float32)
     kf.processNoiseCov = np.eye(3, dtype=np.float32) * 1e-4
@@ -95,7 +95,8 @@ def main():
     waypoints = [np.array([0, 0])]
     last_waypoint_update = time.time()
 
-    total_offset = np.array([0.0, 0.0])  # Накопленное смещение с начала трекинга
+    anchor_offset = None  # Якорь — первый накопленный оффсет
+    total_offset = np.array([0.0, 0.0])  # Накопленное смещение относительно якоря
 
     while True:
         ret, frame = cap.read()
@@ -114,7 +115,8 @@ def main():
             tracking_initialized = False
             prev_angle = 0.0
             kalman = init_kalman()
-            total_offset = np.array([0.0, 0.0])  # Сброс накопленного смещения при выключенном трекинге
+            anchor_offset = None  # Сброс якоря
+            total_offset = np.array([0.0, 0.0])  # Сброс смещения при отключении трекинга
 
             vis = frame_proc.copy()
             cv2.putText(vis, "Tracking disabled (press 't' to enable)", (10, 30),
@@ -136,7 +138,8 @@ def main():
                 tracking_initialized = True
                 prev_angle = 0.0
                 kalman = init_kalman()
-                total_offset = np.array([0.0, 0.0])  # Начинаем накопление заново
+                anchor_offset = None  # Якорь будет установлен при первом смещении
+                total_offset = np.array([0.0, 0.0])
             else:
                 vis = frame_proc.copy()
                 cv2.putText(vis, "No keypoints for initialization", (10, 30),
@@ -158,6 +161,7 @@ def main():
             tracking_initialized = False
             prev_angle = 0.0
             kalman = init_kalman()
+            anchor_offset = None
             total_offset = np.array([0.0, 0.0])
             continue
 
@@ -172,6 +176,7 @@ def main():
             tracking_initialized = False
             prev_angle = 0.0
             kalman = init_kalman()
+            anchor_offset = None
             total_offset = np.array([0.0, 0.0])
             continue
 
@@ -196,16 +201,22 @@ def main():
         avg_dx = np.mean(dxs)
         avg_dy = np.mean(dys)
 
-        total_offset += np.array([avg_dx, avg_dy])
+        # Если якорь не установлен, установить первый кадр смещения
+        if anchor_offset is None:
+            anchor_offset = np.array([avg_dx, avg_dy])
+            total_offset = np.array([0.0, 0.0])  # смещение относительно якоря — в нуле
+        else:
+            # Накопленное смещение относительно якоря
+            total_offset += np.array([avg_dx, avg_dy]) - anchor_offset
 
         nearest_wp, nearest_idx = find_nearest_waypoint(total_offset, waypoints)
 
-        if nearest_wp is not None and np.linalg.norm(total_offset - nearest_wp) < 10.0:
+        if nearest_wp is not None and np.linalg.norm(total_offset - nearest_wp) < 5.0:
             logging.info(f"Waypoint {nearest_idx} достигнут и удалён")
             remove_waypoint(waypoints, nearest_idx)
 
         current_time = time.time()
-        if current_time - last_waypoint_update > 5.0:
+        if current_time - last_waypoint_update > 1.0:
             last_waypoint_update = current_time
             if len(waypoints) == 0:
                 waypoints.extend([
@@ -263,6 +274,7 @@ def main():
                 prev_angle = 0.0
                 tracking_initialized = True
                 kalman = init_kalman()
+                anchor_offset = None
                 total_offset = np.array([0.0, 0.0])
         elif key == ord('t'):
             t_tracking_flag()
