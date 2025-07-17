@@ -34,14 +34,14 @@ def t_tracking_flag():
     current = is_tracking_enabled()
     set_tracking(not current)
 
-def save_offset(avg_x, avg_y, angle):
+def save_offset(offset_dx, offset_dy, angle):
     data = {
-        'x': float(avg_x),
-        'y': float(avg_y),
+        'dx': float(offset_dx),
+        'dy': float(offset_dy),
         'angle': float(angle)
     }
-    tmp_filename = '/home/orangepi/Documents/YOLO/offsets_tmp.json'
-    final_filename = '/home/orangepi/Documents/YOLO/offsets.json'
+    tmp_filename = 'offsets_tmp.json'
+    final_filename = 'offsets.json'
     try:
         with open(tmp_filename, 'w') as f:
             json.dump(data, f)
@@ -49,28 +49,32 @@ def save_offset(avg_x, avg_y, angle):
     except Exception as e:
         logging.error(f"Error saving offsets: {e}")
 
-def init_kalman():
-    kf = cv2.KalmanFilter(3, 3)
-    kf.transitionMatrix = np.eye(3, dtype=np.float32)
-    kf.measurementMatrix = np.eye(3, dtype=np.float32)
-    kf.processNoiseCov = np.eye(3, dtype=np.float32) * 1e-4
-    kf.measurementNoiseCov = np.eye(3, dtype=np.float32) * 1e-2
-    kf.statePre = np.zeros((3, 1), dtype=np.float32)
-    kf.statePost = np.zeros((3, 1), dtype=np.float32)
-    return kf
+def add_waypoint(waypoints, points, angle):
+    waypoints.append({'points': points.copy(), 'angle': angle})
 
-def add_waypoint(waypoints, offset_pos, angle):
-    # Добавляем waypoint с позицией (2D) и углом
-    waypoints.append({'pos': np.array(offset_pos), 'angle': angle})
+def points_diff(points1, points2, threshold=3.0):
+    if points1 is None or points2 is None:
+        return True
+    if points1.shape != points2.shape:
+        return True
+    diff = np.linalg.norm(points1 - points2, axis=1)
+    mean_diff = np.mean(diff)
+    return mean_diff > threshold
 
-def draw_opposite_arrow(img, start_point, direction_vector, length=50, color=(0, 255, 0), thickness=2):
-    norm = np.linalg.norm(direction_vector)
-    if norm == 0:
-        return img
-    dir_norm = -direction_vector / norm  # обратное направление
-    end_point = (int(start_point[0] + dir_norm[0] * length), int(start_point[1] + dir_norm[1] * length))
-    cv2.arrowedLine(img, (int(start_point[0]), int(start_point[1])), end_point, color, thickness, tipLength=0.3)
-    return img
+def angle_diff(a1, a2):
+    diff = abs(a1 - a2) % 360
+    if diff > 180:
+        diff = 360 - diff
+    return diff
+
+def smooth_points(points1, points2, alpha=0.3):
+    return alpha * points1 + (1 - alpha) * points2
+
+def find_returned_node(waypoints, current_points, threshold=2.0):
+    for i, node in enumerate(waypoints):
+        if not points_diff(current_points, node['points'], threshold=threshold):
+            return i
+    return None
 
 def main():
     cap = cv2.VideoCapture(0)
@@ -85,16 +89,15 @@ def main():
     first_gray = None
     first_pts = None
     tracking_initialized = False
-    kalman = init_kalman()
 
-    anchor_offset = None
-    total_offset = np.array([0.0, 0.0, 0.0])
-    current_waypoint_index = 0
+    anchor_points = None
+    anchor_angle = None
     waypoints = []
     last_waypoint_time = 0
+    waypoint_add_interval = 1.0  # секунды
 
-    last_angle = None
-    angle_threshold = 15  # градусов — порог резкого поворота камеры
+    accumulated_dx = 0.0
+    accumulated_dy = 0.0
 
     while True:
         ret, frame = cap.read()
@@ -106,16 +109,15 @@ def main():
         gray = cv2.cvtColor(frame_proc, cv2.COLOR_BGR2GRAY)
 
         if not tracking_enabled:
-            # Сбрасываем всё при отключенном трекинге
             first_gray = None
             first_pts = None
             tracking_initialized = False
-            kalman = init_kalman()
-            anchor_offset = None
-            total_offset = np.array([0.0, 0.0, 0.0])
+            anchor_points = None
+            anchor_angle = None
             waypoints.clear()
-            current_waypoint_index = 0
-            last_angle = None
+            last_waypoint_time = 0
+            accumulated_dx = 0
+            accumulated_dy = 0
 
             vis = frame_proc.copy()
             cv2.putText(vis, "Tracking disabled (press 't' to enable)", (10, 30),
@@ -135,24 +137,24 @@ def main():
                 first_gray = gray.copy()
                 first_pts = pts
                 tracking_initialized = True
-                kalman = init_kalman()
-                anchor_offset = None
-                total_offset = np.array([0.0, 0.0, 0.0])
+                anchor_points = None
+                anchor_angle = None
                 waypoints.clear()
-                current_waypoint_index = 0
                 last_waypoint_time = time.time()
-                last_angle = None
+                accumulated_dx = 0
+                accumulated_dy = 0
             continue
 
         next_pts, status, error = cv2.calcOpticalFlowPyrLK(first_gray, gray, first_pts, None, **lk_params)
 
         if next_pts is None or status is None:
             tracking_initialized = False
-            anchor_offset = None
-            total_offset = np.array([0.0, 0.0, 0.0])
+            anchor_points = None
+            anchor_angle = None
             waypoints.clear()
-            current_waypoint_index = 0
-            last_angle = None
+            last_waypoint_time = 0
+            accumulated_dx = 0
+            accumulated_dy = 0
             continue
 
         status = status.flatten()
@@ -160,7 +162,9 @@ def main():
         good_old = first_pts[status == 1].reshape(-1, 2)
 
         if len(good_new) < 10:
-            continue
+            # слишком мало точек для надёжного трекинга
+            tracking_initialized = False
+            pass
 
         H, inliers = cv2.estimateAffinePartial2D(good_old.reshape(-1, 1, 2), good_new.reshape(-1, 1, 2),
                                                  method=cv2.RANSAC, ransacReprojThreshold=3, maxIters=2000)
@@ -170,93 +174,85 @@ def main():
             raw_angle = math.degrees(math.atan2(H[1, 0], H[0, 0]))
             angle = raw_angle
 
+        # Рассчёт среднего смещения
         dxs = good_new[:, 0] - good_old[:, 0]
         dys = good_new[:, 1] - good_old[:, 1]
         avg_dx = np.mean(dxs)
         avg_dy = np.mean(dys)
 
-        # Фильтрация Калмана (упрощённая)
-        measured = np.array([[avg_dx], [avg_dy], [angle]], dtype=np.float32)
-        kalman.correct(measured)
-        predicted = kalman.predict()
-        filtered_dx, filtered_dy, filtered_angle = predicted.flatten()
+        current_time = time.time()
 
-        if anchor_offset is None:
-            # Инициализация якоря
-            anchor_offset = np.array([filtered_dx, filtered_dy, filtered_angle])
-            add_waypoint(waypoints, [0, 0], filtered_angle)  # Первый узел в начале
-            last_waypoint_time = time.time()
-            last_angle = filtered_angle
+        if anchor_points is None:
+            anchor_points = good_new.copy()
+            anchor_angle = angle
+            add_waypoint(waypoints, anchor_points, anchor_angle)
+            last_waypoint_time = current_time
+            accumulated_dx = 0
+            accumulated_dy = 0
+            logging.info(f"Инициализирован якорь с углом {anchor_angle:.2f}")
 
         else:
-            # Проверяем резкий поворот камеры
-            if last_angle is not None:
-                angle_diff = abs(filtered_angle - last_angle)
-                if angle_diff > angle_threshold:
-                    # Резкий поворот — добавляем waypoint, anchor не сбрасываем
-                    offset_since_anchor = np.array([filtered_dx, filtered_dy, filtered_angle]) - anchor_offset
-                    add_waypoint(waypoints, offset_since_anchor[:2], filtered_angle)
-                    logging.info(f"Добавлен waypoint из-за резкого поворота: угол сдвинулся на {angle_diff:.2f} град")
-                    last_waypoint_time = time.time()
+            # Добавляем новый узел, если прошло достаточно времени и точки сильно отличаются
+            if (current_time - last_waypoint_time) > waypoint_add_interval:
+                if points_diff(good_new, anchor_points, threshold=3.0) and angle_diff(angle, anchor_angle) > 5.0:
+                    add_waypoint(waypoints, good_new, angle)
+                    last_waypoint_time = current_time
+                    anchor_points = smooth_points(anchor_points, good_new, alpha=0.3)
+                    anchor_angle = (anchor_angle * 0.7 + angle * 0.3) % 360
+                    logging.info(f"Добавлен новый узел с углом {angle:.2f}")
 
-            last_angle = filtered_angle
+            # Проверяем возврат к уже пройденному узлу
+            idx = find_returned_node(waypoints, good_new, threshold=2.0)
+            if idx is not None and idx < len(waypoints) - 1:
+                # Удаляем узлы, которые идут после найденного — "возврат назад"
+                removed = waypoints[idx+1:]
+                waypoints = waypoints[:idx+1]
+                logging.info(f"Возврат к узлу {idx}, удалено {len(removed)} узлов")
 
-        # Добавляем узлы примерно раз в 5 секунд (по времени)
-        current_time = time.time()
-        if current_time - last_waypoint_time >= 5.0:
-            offset_since_anchor = np.array([filtered_dx, filtered_dy, filtered_angle]) - anchor_offset
-            add_waypoint(waypoints, offset_since_anchor[:2], filtered_angle)
-            last_waypoint_time = current_time
+            # Аккумулируем смещения
+            accumulated_dx += avg_dx
+            accumulated_dy += avg_dy
 
-        # Проходим по узлам (лесенке) плавно к якарю
-        if len(waypoints) > 0:
-            current_wp = waypoints[current_waypoint_index]['pos']
-            offset_vec = np.array([filtered_dx, filtered_dy])
-            dist = np.linalg.norm(offset_vec - current_wp)
-            if dist < 15:
-                current_waypoint_index += 1
-                if current_waypoint_index >= len(waypoints):
-                    # Дошли до конца — очищаем waypoints и сбрасываем индекс
-                    waypoints.clear()
-                    current_waypoint_index = 0
-                    anchor_offset = np.array([filtered_dx, filtered_dy, filtered_angle])
-                    logging.info("Возврат к якарю завершён, waypoints очищены")
+        # Сохраняем текущие накопленные смещения и отклонение по углу относительно anchor_angle
+        offset_dx = accumulated_dx
+        offset_dy = accumulated_dy
+        offset_angle = (angle - anchor_angle + 180) % 360 - 180  # нормализуем в [-180,180]
 
-        # Сохраняем общий оффсет для внешнего использования
-        total_offset = np.array([filtered_dx, filtered_dy, filtered_angle])
+        save_offset(offset_dx, offset_dy, offset_angle)
 
         # Визуализация
         vis = frame_proc.copy()
+
         for wp in waypoints:
-            cv2.circle(vis, (int(wp['pos'][0] + proc_width//2), int(wp['pos'][1] + proc_height//2)), 5, (255, 0, 0), -1)
+            for p in wp['points']:
+                cv2.circle(vis, (int(p[0]), int(p[1])), 3, (255, 0, 0), -1)
+
+        if anchor_points is not None:
+            for p in anchor_points:
+                cv2.circle(vis, (int(p[0]), int(p[1])), 4, (37, 225, 88), -1)
 
         cv2.putText(vis, f"Tracking Enabled", (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        cv2.putText(vis, f"Waypoint: {current_waypoint_index}/{len(waypoints)}", (10, 60),
+        cv2.putText(vis, f"Waypoints: {len(waypoints)}", (10, 60),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        cv2.putText(vis, f"Filtered dx: {total_offset[0]:.2f}", (10, 90),
+        cv2.putText(vis, f"Accum dx: {offset_dx:.2f}", (10, 90),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        cv2.putText(vis, f"Filtered dy: {total_offset[1]:.2f}", (10, 120),
+        cv2.putText(vis, f"Accum dy: {offset_dy:.2f}", (10, 120),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        cv2.putText(vis, f"Filtered angle: {total_offset[2]:.2f}", (10, 150),
+        cv2.putText(vis, f"Offset angle: {offset_angle:.2f}", (10, 150),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-
-        center_point = (proc_width // 2, proc_height // 2)
-        direction = np.array([filtered_dx, filtered_dy])
-        vis = draw_opposite_arrow(vis, center_point, direction, length=50, color=(0, 255, 0), thickness=2)
-
-        cv2.putText(vis, f"Waypoints: {len(waypoints)} Current WP idx: {current_waypoint_index}", (10, proc_height - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-
-        cv2.imshow("Anchor Optical Flow Tracker", vis)
-
-        save_offset(total_offset[0], total_offset[1], total_offset[2])
 
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
             break
         elif key == ord('t'):
             t_tracking_flag()
+
+        cv2.imshow("Anchor Optical Flow Tracker", vis)
+
+        # Обновляем точки для следующего кадра
+        first_gray = gray.copy()
+        first_pts = good_new.reshape(-1, 1, 2)
 
     cap.release()
     cv2.destroyAllWindows()
