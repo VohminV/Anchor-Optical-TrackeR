@@ -191,7 +191,7 @@ def main():
     anchor_frame_full = None
     waypoints = []
     last_wp_time = 0
-    wp_interval = 1.0  # Waypoint creation interval in seconds
+    wp_interval = 0.5  # Waypoint creation interval in seconds
     tracking = False
     prev_gray = None
     prev_pts = None
@@ -280,7 +280,7 @@ def main():
         prev_pts = good_new.copy()
         
         # Check if we have enough points for reliable tracking
-        if len(good_new) < 10:
+        if len(good_new) < 50:
             # If too few points, increase feature density due to potential wind
             pts = adaptive_good_features(gray, min_features=200, wind_factor=wind_factor*1.5)
             if pts is not None:
@@ -323,20 +323,15 @@ def main():
             last_wp_time = now
             anchor_returned = True
 
+        # Calculate total offset from anchor
+        total_dx, total_dy = mean_offset(good_new, anchor_pts)
+        
         # Сохраняем угол только при возвращении к анкеру, иначе 0
         if anchor_returned:
-            target_pts = anchor_pts
-            target_ang = anchor_ang
             total_ang = angle_diff(current_ang, anchor_ang)
         else:
-            target_wp = waypoints[-1]
-            target_pts = target_wp['points']
-            target_ang = target_wp['angle']
             total_ang = 0.0
-        
-        total_dx, total_dy = mean_offset(good_new, target_pts)
-        total_ang = angle_diff(current_ang, target_ang) if anchor_returned else 0.0
-
+            
         save_offset(total_dx, total_dy, total_ang)
 
         # Visualization

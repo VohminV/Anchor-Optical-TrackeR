@@ -43,7 +43,7 @@ def add_waypoint(wp_list, pts, ang, gray_frame):
         'frame_hash': frame_hash
     })
 
-def adaptive_good_features(gray, min_features=100, max_features=1000, wind_factor=1.0):
+def adaptive_good_features(gray, min_features=50, max_features=500, wind_factor=1.0):
     # Apply CLAHE for contrast enhancement in low-light conditions
     clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8,8))
     enhanced = clahe.apply(gray)
@@ -173,13 +173,27 @@ def rope_ladder_waypoint_management(waypoints, current_points, current_angle, di
     
     return waypoints
 
+def update_and_print_fps(frame_count, start_time, update_interval, total_dx, total_dy, is_tracking_enabled):
+    """
+    Рассчитывает и печатает FPS каждые update_interval кадров.
+    Возвращает текущий рассчитанный FPS.
+    """
+    calculated_fps = 0.0
+    if frame_count % update_interval == 0 and frame_count > 0:
+        elapsed_time = time.time() - start_time
+        if elapsed_time > 0: # Избегаем деления на ноль
+            calculated_fps = update_interval / elapsed_time
+            print(f"FPS: {calculated_fps:.2f} dx:{total_dx:.2f} dy:{total_dy:.2f} Status:{is_tracking_enabled}") # Печатаем FPS в консоль
+        # Сброс времени и счетчика для следующего интервала
+        # Важно: не сбрасываем общий frame_counter, только локальный отсчет
+        start_time = time.time() 
+    return calculated_fps, start_time
+    
 def main():
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         return
-
-    # Set frame dimensions for consistent processing
-    lw, lh = 720, 576
+        
     # LK optical flow parameters optimized for aerial navigation
     lk_params = dict(winSize=(21, 21), maxLevel=3,
                      criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01))
@@ -198,14 +212,24 @@ def main():
     wind_magnitude_history = []
     anchor_returned = False  # Флаг для отслеживания возвращения к анкеру
 
+    # --- Для расчета FPS ---
+    frame_counter = 0
+    start_time = time.time()
+    fps_update_interval = 10 # Обновление значения FPS каждые 10 кадров
+    current_fps = 0.0
+    # ----------------------
+
     while True:
+
+        # --- FPS Calculation Start ---
+        frame_counter += 1
+        # -----------------------------
+
         ret, frame = cap.read()
         if not ret:
             break
 
-        # Resize and convert to grayscale
-        frame_resized = cv2.resize(frame, (lw, lh))
-        gray = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2GRAY)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
         # Check if tracking is disabled
         if not is_tracking_enabled():
@@ -221,11 +245,7 @@ def main():
             wind_magnitude_history.clear()
             anchor_returned = False
             
-            # Display status
-            vis = frame_resized.copy()
-            cv2.putText(vis, "TRACKING OFF (t to toggle)", (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-            cv2.imshow("Tracker", vis)
+            # Debug Controll
             k = cv2.waitKey(1) & 0xFF
             if k == ord('q'):
                 break
@@ -256,7 +276,7 @@ def main():
                 anchor_gray = gray.copy()
                 anchor_pts = pts.reshape(-1, 2).copy()
                 anchor_ang = 0.0
-                anchor_frame_full = frame_resized.copy()
+                anchor_frame_full = frame.copy()
                 waypoints.clear()
                 add_waypoint(waypoints, anchor_pts, anchor_ang, anchor_gray)
                 last_wp_time = time.time()
@@ -339,41 +359,12 @@ def main():
 
         save_offset(total_dx, total_dy, total_ang)
 
-        # Visualization
-        vis = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+        # --- FPS Calculation & Print ---
+        # Вызываем функцию и обновляем current_fps и start_time для следующего интервала
+        current_fps, start_time = update_and_print_fps(frame_counter, start_time, \
+            fps_update_interval, total_dx, total_dy, is_tracking_enabled())
+        # -------------------------------
         
-        # Draw waypoints (rope ladder visualization)
-        for i, wp in enumerate(waypoints):
-            color = (255, 0, 0) if i > 0 else (0, 255, 0)  # Green for anchor, blue for others
-            for p in wp['points']:
-                cv2.circle(vis, (int(p[0]), int(p[1])), 3, color, -1)
-                
-        # Draw connections between waypoints (rope ladder rungs)
-        for i in range(len(waypoints) - 1):
-            if len(waypoints[i]['points']) > 0 and len(waypoints[i+1]['points']) > 0:
-                pt1 = tuple(np.mean(waypoints[i]['points'], axis=0).astype(int))
-                pt2 = tuple(np.mean(waypoints[i+1]['points'], axis=0).astype(int))
-                cv2.line(vis, pt1, pt2, (255, 255, 0), 2)
-                
-        # Draw current tracked points
-        for p in good_new:
-            cv2.circle(vis, (int(p[0]), int(p[1])), 2, (0, 255, 255), -1)
-
-        # Display information
-        cv2.putText(vis, f"Waypoints: {len(waypoints)}", (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        cv2.putText(vis, f"dx:{total_dx:.2f} dy:{total_dy:.2f} ang:{total_ang:.2f}",
-                    (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-        cv2.putText(vis, f"Wind Factor: {wind_factor:.2f}", (10, 90),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-
-        # Indicate if anchor is locked
-        if len(waypoints) == 1:
-            cv2.putText(vis, "ANCHOR LOCKED", (10, 120),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-
-        cv2.imshow("Tracker", vis)
-
         # Handle keyboard input
         k = cv2.waitKey(1) & 0xFF
         if k == ord('q'):
@@ -383,7 +374,6 @@ def main():
 
     # Cleanup
     cap.release()
-    cv2.destroyAllWindows()
 
 def calculate_optical_flow_magnitude(prev_gray, curr_gray, prev_pts):
     """Calculate median optical flow magnitude to detect wind conditions"""
